@@ -2,6 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { v4 as uuidv4 } from "uuid";
 import type {
+  AgentProviderId,
   AppConfig,
   Job,
   JobLogEntry,
@@ -16,12 +17,19 @@ import {
   pushToRemote,
 } from "./github.js";
 import { GitlabService } from "./gitlab.js";
-import { runDocumentationAgent } from "./documenter.js";
+import { runMultiAgentDocumentation } from "./multi-agent-documenter.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_WORK_DIR = path.join(__dirname, "../../../../data/workspaces");
 
 type JobListener = (job: Job) => void;
+
+interface ResolvedJobConfig extends AppConfig {
+  provider: AgentProviderId;
+  agentApiKey: string;
+  agentModel?: string;
+  workerConcurrency: number;
+}
 
 export class JobManager {
   private readonly jobs = new Map<string, Job>();
@@ -100,13 +108,27 @@ export class JobManager {
     this.emit(job);
   }
 
-  private resolveConfig(request: StartJobRequest): AppConfig {
+  private resolveConfig(request: StartJobRequest): ResolvedJobConfig {
+    const provider: AgentProviderId =
+      request.agentProvider ??
+      this.defaultConfig.defaultProvider ??
+      "cursor";
+
+    const cursorApiKey =
+      request.cursorApiKey?.trim() ||
+      this.defaultConfig.cursorApiKey ||
+      process.env.CURSOR_API_KEY ||
+      "";
+    const claudeApiKey =
+      request.claudeApiKey?.trim() ||
+      this.defaultConfig.claudeApiKey ||
+      process.env.ANTHROPIC_API_KEY ||
+      process.env.CLAUDE_API_KEY ||
+      "";
+
     return {
-      cursorApiKey:
-        request.cursorApiKey?.trim() ||
-        this.defaultConfig.cursorApiKey ||
-        process.env.CURSOR_API_KEY ||
-        "",
+      cursorApiKey,
+      claudeApiKey,
       gitlabToken:
         request.gitlabToken?.trim() ||
         this.defaultConfig.gitlabToken ||
@@ -123,6 +145,11 @@ export class JobManager {
         process.env.GITLAB_NAMESPACE ||
         "",
       workDir: this.defaultConfig.workDir || DEFAULT_WORK_DIR,
+      defaultProvider: this.defaultConfig.defaultProvider,
+      provider,
+      agentApiKey: provider === "claude" ? claudeApiKey : cursorApiKey,
+      agentModel: request.agentModel?.trim() || undefined,
+      workerConcurrency: request.workerConcurrency ?? 3,
     };
   }
 
@@ -133,9 +160,11 @@ export class JobManager {
       this.setStatus(job, "validating");
       const config = this.resolveConfig(request);
 
-      if (!config.cursorApiKey) {
+      if (!config.agentApiKey) {
         throw new Error(
-          "CURSOR_API_KEY is required. Set it in .env or the form.",
+          config.provider === "claude"
+            ? "ANTHROPIC_API_KEY (or CLAUDE_API_KEY) is required for the Claude provider. Set it in .env or the form."
+            : "CURSOR_API_KEY is required for the Cursor provider. Set it in .env or the form.",
         );
       }
       if (!config.gitlabToken) {
@@ -151,6 +180,12 @@ export class JobManager {
 
       const { owner, repo } = parseGithubUrl(request.githubUrl);
       this.log(job, "validating", `Validated GitHub repo: ${owner}/${repo}`);
+      this.log(
+        job,
+        "validating",
+        `Agent provider: ${config.provider}` +
+          (config.agentModel ? ` (model: ${config.agentModel})` : ""),
+      );
 
       this.setStatus(job, "cloning");
       this.log(job, "cloning", `Cloning ${request.githubUrl}...`);
@@ -188,13 +223,16 @@ export class JobManager {
       this.log(
         job,
         "documenting",
-        "Starting Cursor agent for extensive documentation...",
+        `Starting multi-agent documentation via ${config.provider}...`,
       );
 
-      const docResult = await runDocumentationAgent(
-        localPath,
-        config.cursorApiKey,
-        (event) => {
+      const docResult = await runMultiAgentDocumentation({
+        cwd: localPath,
+        provider: config.provider,
+        apiKey: config.agentApiKey,
+        model: config.agentModel,
+        concurrency: config.workerConcurrency,
+        onEvent: (event) => {
           const level: JobLogEntry["level"] =
             event.type === "error"
               ? "error"
@@ -203,26 +241,30 @@ export class JobManager {
                 : "info";
           this.log(job, "documenting", event.content, level);
         },
-      );
+      });
 
-      job.result.agentId = docResult.agentId;
-      job.result.runId = docResult.runId;
+      job.result.provider = docResult.provider;
+      job.result.partCount = docResult.plan.parts.length;
+      job.result.agentId = docResult.agentIds.join(",");
+      job.result.runId = docResult.runIds.join(",");
 
       if (docResult.status === "error") {
-        throw new Error("Documentation agent run failed. Check logs for details.");
+        throw new Error(
+          docResult.summary ||
+            "Documentation agents failed. Check logs for details.",
+        );
       }
 
-      if (docResult.summary) {
-        this.log(job, "documenting", docResult.summary, "agent");
-      }
+      this.log(job, "documenting", docResult.summary, "agent");
 
       this.setStatus(job, "committing");
       this.log(job, "committing", "Committing documentation changes...");
       const committed = await commitAllChanges(
         localPath,
-        "docs: add extensive documentation via Cursor agent\n\n" +
-          "Includes expanded README, docs/ guides, inline comments, " +
-          "architecture diagrams, and contributor documentation.",
+        "docs: add extensive documentation via multi-agent documenter\n\n" +
+          `Provider: ${config.provider}. Split into ${docResult.plan.parts.length} part(s) ` +
+          "with planner, parallel workers, and integrator. Includes expanded README, " +
+          "docs/ guides, inline comments, and contributor documentation.",
       );
 
       if (!committed) {

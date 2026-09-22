@@ -10,6 +10,8 @@ export type JobStep =
   | "completed"
   | "failed";
 
+export type AgentProviderId = "cursor" | "claude";
+
 export interface JobLogEntry {
   timestamp: string;
   step: JobStep;
@@ -24,6 +26,8 @@ export interface JobResult {
   agentId?: string;
   runId?: string;
   branch?: string;
+  provider?: AgentProviderId;
+  partCount?: number;
 }
 
 export interface Job {
@@ -41,14 +45,21 @@ export interface StartJobRequest {
   gitlabNamespace?: string;
   gitlabHost?: string;
   gitlabToken?: string;
+  /** @deprecated Prefer agentProvider + matching API key field */
   cursorApiKey?: string;
+  claudeApiKey?: string;
+  agentProvider?: AgentProviderId;
+  agentModel?: string;
+  workerConcurrency?: number;
   branch?: string;
 }
 
 export interface AppConfig {
   cursorApiKey: string;
+  claudeApiKey: string;
   gitlabToken: string;
   gitlabHost: string;
   gitlabNamespace: string;
   workDir: string;
+  defaultProvider: AgentProviderId;
 }

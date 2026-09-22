@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { AgentProviderId } from "./types.js";
 import { JobManager } from "./services/job-manager.js";
 import { startJobSchema } from "./validation.js";
 
@@ -12,12 +13,20 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 3847);
 const isProduction = process.env.NODE_ENV === "production";
 
+function resolveDefaultProvider(): AgentProviderId {
+  const raw = (process.env.AGENT_PROVIDER ?? "cursor").toLowerCase();
+  return raw === "claude" ? "claude" : "cursor";
+}
+
 const jobManager = new JobManager({
   cursorApiKey: process.env.CURSOR_API_KEY ?? "",
+  claudeApiKey:
+    process.env.ANTHROPIC_API_KEY ?? process.env.CLAUDE_API_KEY ?? "",
   gitlabToken: process.env.GITLAB_TOKEN ?? "",
   gitlabHost: process.env.GITLAB_HOST ?? "https://gitlab.com",
   gitlabNamespace: process.env.GITLAB_NAMESPACE ?? "",
   workDir: process.env.WORK_DIR ?? "",
+  defaultProvider: resolveDefaultProvider(),
 });
 
 const app = express();
@@ -30,8 +39,12 @@ app.get("/api/health", (_req, res) => {
     mode: isProduction ? "production" : "development",
     configured: {
       cursorApiKey: Boolean(process.env.CURSOR_API_KEY),
+      claudeApiKey: Boolean(
+        process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY,
+      ),
       gitlabToken: Boolean(process.env.GITLAB_TOKEN),
       gitlabNamespace: Boolean(process.env.GITLAB_NAMESPACE),
+      agentProvider: resolveDefaultProvider(),
     },
   });
 });
@@ -40,7 +53,11 @@ app.get("/api/config", (_req, res) => {
   res.json({
     gitlabHost: process.env.GITLAB_HOST ?? "https://gitlab.com",
     gitlabNamespace: process.env.GITLAB_NAMESPACE ?? "",
+    defaultProvider: resolveDefaultProvider(),
     hasCursorApiKey: Boolean(process.env.CURSOR_API_KEY),
+    hasClaudeApiKey: Boolean(
+      process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY,
+    ),
     hasGitlabToken: Boolean(process.env.GITLAB_TOKEN),
   });
 });

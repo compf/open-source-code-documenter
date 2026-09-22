@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { AppConfig, Job, JobLogEntry, StartJobPayload } from "./types";
+import type {
+  AgentProviderId,
+  AppConfig,
+  Job,
+  JobLogEntry,
+  StartJobPayload,
+} from "./types";
 
 const STEP_LABELS: Record<string, string> = {
   queued: "Queued",
@@ -7,7 +13,7 @@ const STEP_LABELS: Record<string, string> = {
   cloning: "Cloning from GitHub",
   creating_gitlab_project: "Creating GitLab project",
   pushing_to_gitlab: "Pushing mirror to GitLab",
-  documenting: "Generating documentation (Cursor agent)",
+  documenting: "Multi-agent documentation",
   committing: "Committing changes",
   pushing_documentation: "Pushing documentation to GitLab",
   completed: "Completed",
@@ -25,6 +31,9 @@ export default function App() {
   const [gitlabHost, setGitlabHost] = useState("https://gitlab.com");
   const [gitlabToken, setGitlabToken] = useState("");
   const [cursorApiKey, setCursorApiKey] = useState("");
+  const [claudeApiKey, setClaudeApiKey] = useState("");
+  const [agentProvider, setAgentProvider] = useState<AgentProviderId>("cursor");
+  const [workerConcurrency, setWorkerConcurrency] = useState(3);
   const [branch, setBranch] = useState("");
   const [showSecrets, setShowSecrets] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
@@ -41,6 +50,7 @@ export default function App() {
         setConfig(data);
         setGitlabHost(data.gitlabHost);
         setGitlabNamespace(data.gitlabNamespace);
+        setAgentProvider(data.defaultProvider ?? "cursor");
       })
       .catch(() => setError("Could not reach API server. Is it running?"));
   }, []);
@@ -74,11 +84,14 @@ export default function App() {
       gitlabNamespace: gitlabNamespace.trim() || undefined,
       gitlabHost: gitlabHost.trim() || undefined,
       branch: branch.trim() || undefined,
+      agentProvider,
+      workerConcurrency,
     };
 
     if (showSecrets) {
       if (gitlabToken.trim()) payload.gitlabToken = gitlabToken.trim();
       if (cursorApiKey.trim()) payload.cursorApiKey = cursorApiKey.trim();
+      if (claudeApiKey.trim()) payload.claudeApiKey = claudeApiKey.trim();
     }
 
     try {
@@ -114,6 +127,11 @@ export default function App() {
     ? progressSteps.indexOf(job.status === "failed" ? "documenting" : job.status)
     : -1;
 
+  const providerReady =
+    agentProvider === "claude"
+      ? Boolean(config?.hasClaudeApiKey || claudeApiKey.trim())
+      : Boolean(config?.hasCursorApiKey || cursorApiKey.trim());
+
   return (
     <div className="app">
       <header className="header">
@@ -129,7 +147,7 @@ export default function App() {
             <div>
               <h1>Open Source Code Documenter</h1>
               <p className="subtitle">
-                Mirror a GitHub repo to GitLab, then generate extensive documentation with a Cursor agent.
+                Mirror a GitHub repo to GitLab, then document it with a planner plus parallel worker agents (Cursor or Claude).
               </p>
             </div>
           </div>
@@ -177,6 +195,37 @@ export default function App() {
               </label>
             </div>
 
+            <div className="row">
+              <label>
+                Agent provider
+                <select
+                  value={agentProvider}
+                  onChange={(e) =>
+                    setAgentProvider(e.target.value as AgentProviderId)
+                  }
+                  disabled={submitting}
+                >
+                  <option value="cursor">Cursor</option>
+                  <option value="claude">Claude (Anthropic API)</option>
+                </select>
+              </label>
+              <label>
+                Worker concurrency
+                <input
+                  type="number"
+                  min={1}
+                  max={8}
+                  value={workerConcurrency}
+                  onChange={(e) =>
+                    setWorkerConcurrency(
+                      Math.min(8, Math.max(1, Number(e.target.value) || 1)),
+                    )
+                  }
+                  disabled={submitting}
+                />
+              </label>
+            </div>
+
             <label>
               Branch (optional)
               <input
@@ -198,8 +247,8 @@ export default function App() {
               </button>
               {config && (
                 <span className="env-hint">
-                  {config.hasCursorApiKey && config.hasGitlabToken
-                    ? "Using .env defaults"
+                  {providerReady && config.hasGitlabToken
+                    ? "Using .env defaults where set"
                     : "Credentials required via form or .env"}
                 </span>
               )}
@@ -207,16 +256,37 @@ export default function App() {
 
             {showSecrets && (
               <div className="secrets-panel">
-                <label>
-                  Cursor API key
-                  <input
-                    type="password"
-                    placeholder={config?.hasCursorApiKey ? "•••••••• (from .env)" : "cursor_..."}
-                    value={cursorApiKey}
-                    onChange={(e) => setCursorApiKey(e.target.value)}
-                    disabled={submitting}
-                  />
-                </label>
+                {agentProvider === "cursor" ? (
+                  <label>
+                    Cursor API key
+                    <input
+                      type="password"
+                      placeholder={
+                        config?.hasCursorApiKey
+                          ? "•••••••• (from .env)"
+                          : "cursor_..."
+                      }
+                      value={cursorApiKey}
+                      onChange={(e) => setCursorApiKey(e.target.value)}
+                      disabled={submitting}
+                    />
+                  </label>
+                ) : (
+                  <label>
+                    Anthropic API key
+                    <input
+                      type="password"
+                      placeholder={
+                        config?.hasClaudeApiKey
+                          ? "•••••••• (from .env)"
+                          : "sk-ant-..."
+                      }
+                      value={claudeApiKey}
+                      onChange={(e) => setClaudeApiKey(e.target.value)}
+                      disabled={submitting}
+                    />
+                  </label>
+                )}
                 <label>
                   GitLab token
                   <input
@@ -270,8 +340,14 @@ export default function App() {
                 <a href={job.result.gitlabUrl} target="_blank" rel="noreferrer">
                   GitLab: {job.result.gitlabProjectPath}
                 </a>
+                {job.result.provider && (
+                  <span className="meta">Provider: {job.result.provider}</span>
+                )}
+                {job.result.partCount != null && (
+                  <span className="meta">Parts: {job.result.partCount}</span>
+                )}
                 {job.result.agentId && (
-                  <span className="meta">Agent: {job.result.agentId}</span>
+                  <span className="meta">Agents: {job.result.agentId}</span>
                 )}
               </div>
             )}
@@ -299,11 +375,16 @@ export default function App() {
           <ol>
             <li>Clones the GitHub repository locally</li>
             <li>Creates (or reuses) a project in your GitLab namespace and pushes a mirror</li>
-            <li>Runs a <strong>local</strong> Cursor agent to add extensive documentation — README overhaul, <code>docs/</code> guides, inline comments, Mermaid diagrams, and more</li>
+            <li>
+              Runs a <strong>planner</strong> agent that splits the repo into parts, then
+              spawns <strong>parallel worker</strong> agents for deep inline/module docs,
+              plus an <strong>integrator</strong> for README / <code>docs/</code> / CONTRIBUTING
+            </li>
             <li>Commits and pushes the documented version back to GitLab</li>
           </ol>
           <p className="note">
-            Cloud Cursor agents currently support GitHub repos only, so documentation runs locally against the cloned copy. The final result lives on GitLab.
+            Choose Cursor or Claude (Anthropic API key). Large repos benefit from more worker
+            parts; concurrency controls how many workers run at once.
           </p>
         </section>
       </main>

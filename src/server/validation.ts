@@ -39,6 +39,10 @@ export const startJobSchema = z.object({
   gitlabHost: z.string().url().optional(),
   gitlabToken: z.string().min(1).optional(),
   cursorApiKey: z.string().min(1).optional(),
+  claudeApiKey: z.string().min(1).optional(),
+  agentProvider: z.enum(["cursor", "claude"]).optional(),
+  agentModel: z.string().min(1).optional(),
+  workerConcurrency: z.number().int().min(1).max(8).optional(),
   branch: z.string().min(1).optional(),
 });
 

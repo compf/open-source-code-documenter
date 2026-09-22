@@ -148,7 +148,8 @@ label {
   color: var(--muted);
 }
 
-input {
+input,
+select {
   font: inherit;
   font-size: 0.95rem;
   padding: 0.65rem 0.85rem;
@@ -159,12 +160,14 @@ input {
   transition: border-color 0.15s;
 }
 
-input:focus {
+input:focus,
+select:focus {
   outline: none;
   border-color: var(--accent);
 }
 
-input:disabled {
+input:disabled,
+select:disabled {
   opacity: 0.6;
 }
 
