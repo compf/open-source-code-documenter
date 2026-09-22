@@ -15,7 +15,6 @@ import {
   cleanupWorkDir,
   commitAllChanges,
   prepareGithubWorkspace,
-  pushToRemote,
   reinitializeAsFreshRepo,
 } from "./github.js";
 import { GitlabService } from "./gitlab.js";
@@ -25,6 +24,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_WORK_DIR = path.join(__dirname, "../../../../data/workspaces");
 
 type JobListener = (job: Job) => void;
+
+interface PublishContext {
+  localPath: string;
+  branch: string;
+  repo: string;
+  namespace: string;
+  host: string;
+  token: string;
+  description: string;
+  publishing?: boolean;
+}
 
 interface ResolvedJobConfig extends AppConfig {
   provider: AgentProviderId;
@@ -36,6 +46,7 @@ interface ResolvedJobConfig extends AppConfig {
 export class JobManager {
   private readonly jobs = new Map<string, Job>();
   private readonly listeners = new Map<string, Set<JobListener>>();
+  private readonly pendingPublish = new Map<string, PublishContext>();
 
   constructor(private readonly defaultConfig: AppConfig) {}
 
@@ -240,53 +251,6 @@ export class JobManager {
         );
       }
 
-      this.setStatus(job, "creating_gitlab_project");
-      const gitlab = new GitlabService(config.gitlabHost, config.gitlabToken);
-      const description = `Mirrored from ${request.githubUrl} — documented by Open Source Code Documenter`;
-      let project;
-      try {
-        project = fresh.replaced
-          ? await gitlab.recreateProject(repo, config.gitlabNamespace, description)
-          : await gitlab.createOrUpdateProject(
-              repo,
-              config.gitlabNamespace,
-              description,
-            );
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`GitLab project setup failed: ${message}`);
-      }
-      job.result.gitlabUrl = project.webUrl;
-      job.result.gitlabProjectPath = project.pathWithNamespace;
-      this.log(
-        job,
-        "creating_gitlab_project",
-        fresh.replaced
-          ? `Created a new empty GitLab project: ${project.webUrl}`
-          : `GitLab project ready: ${project.webUrl}`,
-      );
-
-      this.setStatus(job, "pushing_to_gitlab");
-      this.log(
-        job,
-        "pushing_to_gitlab",
-        "Pushing fresh repository to GitLab...",
-      );
-      try {
-        await gitlab.mirrorToGitlab(localPath, project, branch);
-      } catch (err) {
-        const message =
-          err instanceof WorkspaceError
-            ? err.message
-            : err instanceof Error
-              ? err.message
-              : String(err);
-        throw new Error(
-          `${message} Workspace kept at ${localPath} — re-run this job to resume without recloning.`,
-        );
-      }
-      this.log(job, "pushing_to_gitlab", "Mirror pushed successfully.");
-
       this.setStatus(job, "documenting");
       this.log(
         job,
@@ -347,45 +311,15 @@ export class JobManager {
         this.log(job, "committing", "Documentation changes committed.");
       }
 
-      this.setStatus(job, "pushing_documentation");
-      if (committed) {
-        this.log(
-          job,
-          "pushing_documentation",
-          "Pushing documented repo to GitLab...",
-        );
-        try {
-          await pushToRemote(localPath, "gitlab", branch);
-        } catch (err) {
-          const message =
-            err instanceof WorkspaceError
-              ? err.message
-              : err instanceof Error
-                ? err.message
-                : String(err);
-          throw new Error(
-            `${message} Workspace kept at ${localPath} — re-run to push without recloning.`,
-          );
-        }
-        this.log(
-          job,
-          "pushing_documentation",
-          `Documentation pushed to ${project.webUrl}`,
-        );
-      }
-
-      this.setStatus(job, "completed");
-      this.log(
-        job,
-        "completed",
-        `Done! View documented repo: ${project.webUrl}`,
-      );
-
-      // Successful end-to-end run: free disk
-      keepWorkspace = false;
-      await cleanupWorkDir(localPath);
-      this.log(job, "completed", `Cleaned up workspace ${localPath}`);
-      job.result.localPath = undefined;
+      await this.finishPublish(job, {
+        localPath,
+        branch,
+        repo,
+        namespace: config.gitlabNamespace,
+        host: config.gitlabHost,
+        token: config.gitlabToken,
+        description: `Mirrored from ${request.githubUrl} — documented by Open Source Code Documenter`,
+      }, false);
     } catch (err) {
       const message =
         err instanceof WorkspaceError
@@ -399,7 +333,112 @@ export class JobManager {
           : message;
       this.fail(job, withHint);
     } finally {
-      // Intentionally do not delete on failure so the next run can reuse the clone.
+      // The workspace stays on disk until a successful push, including while
+      // waiting for confirmation to replace an existing GitLab project.
+    }
+  }
+
+  confirmGitlabReplace(id: string): Job {
+    const job = this.jobs.get(id);
+    if (!job) {
+      throw new Error("Job not found");
+    }
+    if (job.status !== "awaiting_gitlab_confirmation") {
+      throw new Error(
+        "This job is not waiting for confirmation to replace a GitLab project",
+      );
+    }
+    const ctx = this.pendingPublish.get(id);
+    if (!ctx) {
+      throw new Error(
+        "The publish step expired. Re-run the job; the local workspace is still on disk.",
+      );
+    }
+    if (ctx.publishing) {
+      return job;
+    }
+    ctx.publishing = true;
+    void this.finishPublish(job, ctx, true);
+    return job;
+  }
+
+  private async finishPublish(
+    job: Job,
+    ctx: PublishContext,
+    replaceExisting: boolean,
+  ): Promise<void> {
+    const gitlab = new GitlabService(ctx.host, ctx.token);
+    const pathWithNamespace = `${ctx.namespace}/${ctx.repo}`;
+
+    try {
+      const existing = await gitlab.findProject(pathWithNamespace);
+      if (existing && !replaceExisting) {
+        job.result.gitlabUrl = existing.webUrl;
+        job.result.gitlabProjectPath = existing.pathWithNamespace;
+        this.pendingPublish.set(job.id, ctx);
+        this.setStatus(job, "awaiting_gitlab_confirmation");
+        this.log(
+          job,
+          "awaiting_gitlab_confirmation",
+          `GitLab project already exists at ${existing.webUrl}. Nothing was deleted. Confirm to delete it and push the documented repository.`,
+        );
+        return;
+      }
+
+      this.setStatus(job, "creating_gitlab_project");
+      const project = existing
+        ? await gitlab.recreateProject(ctx.repo, ctx.namespace, ctx.description)
+        : await gitlab.createOrUpdateProject(
+            ctx.repo,
+            ctx.namespace,
+            ctx.description,
+          );
+      job.result.gitlabUrl = project.webUrl;
+      job.result.gitlabProjectPath = project.pathWithNamespace;
+      this.log(
+        job,
+        "creating_gitlab_project",
+        existing
+          ? `Deleted the existing project and created ${project.webUrl}`
+          : `Created GitLab project ${project.webUrl}`,
+      );
+
+      this.setStatus(job, "pushing_documentation");
+      this.log(
+        job,
+        "pushing_documentation",
+        "Pushing the documented repository to GitLab...",
+      );
+      await gitlab.mirrorToGitlab(ctx.localPath, project, ctx.branch);
+      this.pendingPublish.delete(job.id);
+
+      this.setStatus(job, "completed");
+      this.log(
+        job,
+        "completed",
+        `Done! View documented repo: ${project.webUrl}`,
+      );
+      await cleanupWorkDir(ctx.localPath);
+      job.result.localPath = undefined;
+      this.log(job, "completed", `Cleaned up workspace ${ctx.localPath}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      ctx.publishing = false;
+      const hint = `${message} Workspace kept at ${ctx.localPath}.`;
+      if (replaceExisting) {
+        this.pendingPublish.set(job.id, ctx);
+        job.error = hint;
+        this.setStatus(job, "awaiting_gitlab_confirmation");
+        this.log(
+          job,
+          "awaiting_gitlab_confirmation",
+          `${hint} Confirm again to retry the replace and push.`,
+          "error",
+        );
+        return;
+      }
+      this.pendingPublish.delete(job.id);
+      this.fail(job, hint);
     }
   }
 }

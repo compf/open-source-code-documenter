@@ -2,10 +2,10 @@ export type JobStep =
   | "queued"
   | "validating"
   | "cloning"
-  | "creating_gitlab_project"
-  | "pushing_to_gitlab"
   | "documenting"
   | "committing"
+  | "awaiting_gitlab_confirmation"
+  | "creating_gitlab_project"
   | "pushing_documentation"
   | "completed"
   | "failed";
