@@ -1,5 +1,6 @@
 import { simpleGit, type RemoteWithRefs } from "simple-git";
 import { normalizeGitlabHost } from "../validation.js";
+import { WorkspaceError, formatGitError } from "./github.js";
 
 export interface GitlabProjectInfo {
   id: number;
@@ -26,12 +27,34 @@ export class GitlabService {
     };
   }
 
+  private async readErrorBody(res: Response): Promise<string> {
+    try {
+      const text = await res.text();
+      if (!text.trim()) return res.statusText || String(res.status);
+      try {
+        const json = JSON.parse(text) as {
+          message?: string | Record<string, unknown>;
+          error?: string;
+        };
+        if (typeof json.message === "string") return json.message;
+        if (json.message && typeof json.message === "object") {
+          return JSON.stringify(json.message);
+        }
+        if (typeof json.error === "string") return json.error;
+      } catch {
+        // not JSON
+      }
+      return text.slice(0, 500);
+    } catch {
+      return res.statusText || String(res.status);
+    }
+  }
+
   async resolveNamespaceId(namespace: string): Promise<number> {
     const encoded = encodeURIComponent(namespace);
-    const groupRes = await fetch(
-      `${this.apiBase()}/groups/${encoded}`,
-      { headers: this.headers() },
-    );
+    const groupRes = await fetch(`${this.apiBase()}/groups/${encoded}`, {
+      headers: this.headers(),
+    });
     if (groupRes.ok) {
       const group = (await groupRes.json()) as { id: number };
       return group.id;
@@ -42,7 +65,7 @@ export class GitlabService {
     });
     if (!userRes.ok) {
       throw new Error(
-        `Failed to resolve GitLab namespace "${namespace}": ${userRes.statusText}`,
+        `Failed to resolve GitLab namespace "${namespace}": ${userRes.status} ${await this.readErrorBody(userRes)}. Check GITLAB_TOKEN scopes (needs api).`,
       );
     }
     const user = (await userRes.json()) as { username: string; id: number };
@@ -51,7 +74,7 @@ export class GitlabService {
     }
 
     throw new Error(
-      `GitLab namespace "${namespace}" not found. Use a group path or your username.`,
+      `GitLab namespace "${namespace}" not found as a group, and it is not your username (${user.username}).`,
     );
   }
 
@@ -62,7 +85,9 @@ export class GitlabService {
     });
     if (res.status === 404) return null;
     if (!res.ok) {
-      throw new Error(`GitLab project lookup failed: ${res.statusText}`);
+      throw new Error(
+        `GitLab project lookup failed for "${pathWithNamespace}": ${res.status} ${await this.readErrorBody(res)}`,
+      );
     }
     return this.mapProject(await res.json());
   }
@@ -93,8 +118,9 @@ export class GitlabService {
     });
 
     if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Failed to create GitLab project: ${res.status} ${body}`);
+      throw new Error(
+        `Failed to create GitLab project "${pathWithNamespace}": ${res.status} ${await this.readErrorBody(res)}`,
+      );
     }
 
     return this.mapProject(await res.json());
@@ -105,18 +131,30 @@ export class GitlabService {
     project: GitlabProjectInfo,
     branch: string,
   ): Promise<void> {
-    const git = simpleGit(localPath);
-    const pushUrl = this.authenticatedPushUrl(project.httpUrlToRepo);
+    try {
+      const git = simpleGit(localPath);
+      const pushUrl = this.authenticatedPushUrl(project.httpUrlToRepo);
 
-    const remotes = await git.getRemotes(true);
-    const hasGitlab = remotes.some((r: RemoteWithRefs) => r.name === "gitlab");
-    if (!hasGitlab) {
-      await git.addRemote("gitlab", pushUrl);
-    } else {
-      await git.remote(["set-url", "gitlab", pushUrl]);
+      const remotes = await git.getRemotes(true);
+      const hasGitlab = remotes.some((r: RemoteWithRefs) => r.name === "gitlab");
+      if (!hasGitlab) {
+        await git.addRemote("gitlab", pushUrl);
+      } else {
+        await git.remote(["set-url", "gitlab", pushUrl]);
+      }
+
+      await git.push("gitlab", branch, ["--set-upstream", "--force"]);
+    } catch (err) {
+      if (err instanceof WorkspaceError) throw err;
+      throw new WorkspaceError(
+        formatGitError(
+          err,
+          `Pushing mirror to GitLab (${project.pathWithNamespace})`,
+        ),
+        "push",
+        err,
+      );
     }
-
-    await git.push("gitlab", branch, ["--set-upstream", "--force"]);
   }
 
   private authenticatedPushUrl(httpUrl: string): string {

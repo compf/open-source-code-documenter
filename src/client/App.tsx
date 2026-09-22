@@ -346,8 +346,22 @@ export default function App() {
                 {job.result.partCount != null && (
                   <span className="meta">Parts: {job.result.partCount}</span>
                 )}
+                {job.result.workspaceReused && (
+                  <span className="meta">Workspace reused</span>
+                )}
+                {job.result.localPath && (
+                  <span className="meta">Local: {job.result.localPath}</span>
+                )}
                 {job.result.agentId && (
                   <span className="meta">Agents: {job.result.agentId}</span>
+                )}
+              </div>
+            )}
+            {!job.result.gitlabUrl && job.result.localPath && (
+              <div className="result-links">
+                <span className="meta">Workspace: {job.result.localPath}</span>
+                {job.result.workspaceReused && (
+                  <span className="meta">Reused existing clone</span>
                 )}
               </div>
             )}

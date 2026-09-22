@@ -34,6 +34,8 @@ export interface Job {
     branch?: string;
     provider?: AgentProviderId;
     partCount?: number;
+    localPath?: string;
+    workspaceReused?: boolean;
   };
   error?: string;
 }

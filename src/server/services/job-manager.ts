@@ -11,9 +11,10 @@ import type {
 } from "../types.js";
 import { parseGithubUrl } from "../validation.js";
 import {
+  WorkspaceError,
   cleanupWorkDir,
-  cloneGithubRepo,
   commitAllChanges,
+  prepareGithubWorkspace,
   pushToRemote,
 } from "./github.js";
 import { GitlabService } from "./gitlab.js";
@@ -155,6 +156,7 @@ export class JobManager {
 
   private async executeJob(job: Job, request: StartJobRequest): Promise<void> {
     let localPath: string | undefined;
+    let keepWorkspace = false;
 
     try {
       this.setStatus(job, "validating");
@@ -188,24 +190,51 @@ export class JobManager {
       );
 
       this.setStatus(job, "cloning");
-      this.log(job, "cloning", `Cloning ${request.githubUrl}...`);
-      const cloned = await cloneGithubRepo(
+      this.log(
+        job,
+        "cloning",
+        `Preparing shallow clone (depth 1) of ${request.githubUrl}...`,
+      );
+
+      const prepared = await prepareGithubWorkspace(
         request.githubUrl,
         config.workDir,
         request.branch,
       );
-      localPath = cloned.localPath;
-      const branch = cloned.defaultBranch;
+      localPath = prepared.localPath;
+      keepWorkspace = true;
+      job.result.localPath = localPath;
+      job.result.workspaceReused = prepared.reused;
+      const branch = prepared.defaultBranch;
       job.result.branch = branch;
-      this.log(job, "cloning", `Cloned to ${localPath} (branch: ${branch})`);
+
+      if (prepared.reused) {
+        this.log(
+          job,
+          "cloning",
+          `Reused existing workspace at ${localPath} (branch: ${branch}) — skipped full reclone.`,
+        );
+      } else {
+        this.log(
+          job,
+          "cloning",
+          `Shallow-cloned to ${localPath} (branch: ${branch})`,
+        );
+      }
 
       this.setStatus(job, "creating_gitlab_project");
       const gitlab = new GitlabService(config.gitlabHost, config.gitlabToken);
-      const project = await gitlab.createOrUpdateProject(
-        repo,
-        config.gitlabNamespace,
-        `Mirrored from ${request.githubUrl} — documented by Open Source Code Documenter`,
-      );
+      let project;
+      try {
+        project = await gitlab.createOrUpdateProject(
+          repo,
+          config.gitlabNamespace,
+          `Mirrored from ${request.githubUrl} — documented by Open Source Code Documenter`,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`GitLab project setup failed: ${message}`);
+      }
       job.result.gitlabUrl = project.webUrl;
       job.result.gitlabProjectPath = project.pathWithNamespace;
       this.log(
@@ -216,7 +245,19 @@ export class JobManager {
 
       this.setStatus(job, "pushing_to_gitlab");
       this.log(job, "pushing_to_gitlab", "Pushing mirror to GitLab...");
-      await gitlab.mirrorToGitlab(localPath, project, branch);
+      try {
+        await gitlab.mirrorToGitlab(localPath, project, branch);
+      } catch (err) {
+        const message =
+          err instanceof WorkspaceError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : String(err);
+        throw new Error(
+          `${message} Workspace kept at ${localPath} — re-run this job to resume without recloning.`,
+        );
+      }
       this.log(job, "pushing_to_gitlab", "Mirror pushed successfully.");
 
       this.setStatus(job, "documenting");
@@ -250,8 +291,9 @@ export class JobManager {
 
       if (docResult.status === "error") {
         throw new Error(
-          docResult.summary ||
-            "Documentation agents failed. Check logs for details.",
+          (docResult.summary ||
+            "Documentation agents failed. Check logs for details.") +
+            ` Workspace kept at ${localPath} — re-run to resume without recloning.`,
         );
       }
 
@@ -285,7 +327,19 @@ export class JobManager {
           "pushing_documentation",
           "Pushing documented repo to GitLab...",
         );
-        await pushToRemote(localPath, "gitlab", branch);
+        try {
+          await pushToRemote(localPath, "gitlab", branch);
+        } catch (err) {
+          const message =
+            err instanceof WorkspaceError
+              ? err.message
+              : err instanceof Error
+                ? err.message
+                : String(err);
+          throw new Error(
+            `${message} Workspace kept at ${localPath} — re-run to push without recloning.`,
+          );
+        }
         this.log(
           job,
           "pushing_documentation",
@@ -299,13 +353,26 @@ export class JobManager {
         "completed",
         `Done! View documented repo: ${project.webUrl}`,
       );
+
+      // Successful end-to-end run: free disk
+      keepWorkspace = false;
+      await cleanupWorkDir(localPath);
+      this.log(job, "completed", `Cleaned up workspace ${localPath}`);
+      job.result.localPath = undefined;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.fail(job, message);
+      const message =
+        err instanceof WorkspaceError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      const withHint =
+        keepWorkspace && localPath && !message.includes("Workspace kept")
+          ? `${message} Workspace kept at ${localPath} — re-run this job to resume without recloning.`
+          : message;
+      this.fail(job, withHint);
     } finally {
-      if (localPath) {
-        await cleanupWorkDir(localPath);
-      }
+      // Intentionally do not delete on failure so the next run can reuse the clone.
     }
   }
 }

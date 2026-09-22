@@ -28,6 +28,9 @@ export interface JobResult {
   branch?: string;
   provider?: AgentProviderId;
   partCount?: number;
+  /** Local workspace path kept on failure so the next run can reuse the clone */
+  localPath?: string;
+  workspaceReused?: boolean;
 }
 
 export interface Job {
