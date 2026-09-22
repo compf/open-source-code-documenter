@@ -102,7 +102,32 @@ export class GitlabService {
     if (existing) {
       return existing;
     }
+    return this.createProject(repoName, namespace, description);
+  }
 
+  /**
+   * Remove an existing GitLab project (so a previous shallow push cannot block
+   * the new history) and create an empty project in its place.
+   */
+  async recreateProject(
+    repoName: string,
+    namespace: string,
+    description: string,
+  ): Promise<GitlabProjectInfo> {
+    const pathWithNamespace = `${namespace}/${repoName}`;
+    const existing = await this.findProject(pathWithNamespace);
+    if (existing) {
+      await this.deleteProject(existing);
+    }
+    return this.createProjectWithRetry(repoName, namespace, description);
+  }
+
+  private async createProject(
+    repoName: string,
+    namespace: string,
+    description: string,
+  ): Promise<GitlabProjectInfo> {
+    const pathWithNamespace = `${namespace}/${repoName}`;
     const namespaceId = await this.resolveNamespaceId(namespace);
     const res = await fetch(`${this.apiBase()}/projects`, {
       method: "POST",
@@ -124,6 +149,53 @@ export class GitlabService {
     }
 
     return this.mapProject(await res.json());
+  }
+
+  private async createProjectWithRetry(
+    repoName: string,
+    namespace: string,
+    description: string,
+  ): Promise<GitlabProjectInfo> {
+    let lastError: Error | undefined;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        return await this.createProject(repoName, namespace, description);
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        const pending = /already been taken|pending deletion|still being deleted/i.test(
+          lastError.message,
+        );
+        if (!pending || attempt === 4) throw lastError;
+        await new Promise((resolve) => setTimeout(resolve, 1500 * (attempt + 1)));
+      }
+    }
+    throw lastError ?? new Error("Failed to create GitLab project");
+  }
+
+  private async deleteProject(project: GitlabProjectInfo): Promise<void> {
+    const permanent = new URLSearchParams({
+      permanently_remove: "true",
+      full_path: project.pathWithNamespace,
+    });
+    const permanentRes = await fetch(
+      `${this.apiBase()}/projects/${project.id}?${permanent}`,
+      { method: "DELETE", headers: this.headers() },
+    );
+    if (permanentRes.ok || permanentRes.status === 202 || permanentRes.status === 404) {
+      return;
+    }
+
+    const scheduled = await fetch(`${this.apiBase()}/projects/${project.id}`, {
+      method: "DELETE",
+      headers: this.headers(),
+    });
+    if (scheduled.ok || scheduled.status === 202 || scheduled.status === 404) {
+      return;
+    }
+
+    throw new Error(
+      `Failed to delete GitLab project "${project.pathWithNamespace}": ${scheduled.status} ${await this.readErrorBody(scheduled)}`,
+    );
   }
 
   async mirrorToGitlab(

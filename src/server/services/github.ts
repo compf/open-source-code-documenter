@@ -173,6 +173,57 @@ export async function cleanupWorkDir(localPath: string): Promise<void> {
   }
 }
 
+/**
+ * Drop the cloned Git history (shallow GitHub clones are rejected by GitLab)
+ * and create a normal single-commit repository from the working tree.
+ * Skipped when the workspace is already a non-shallow repo we created earlier,
+ * so a retry can push again without recloning or discarding local edits.
+ */
+export async function reinitializeAsFreshRepo(
+  localPath: string,
+  branch: string,
+): Promise<{ replaced: boolean }> {
+  const git = simpleGit(localPath);
+  const isRepo = await git.checkIsRepo();
+  if (isRepo) {
+    const shallow = (
+      await git.raw(["rev-parse", "--is-shallow-repository"])
+    ).trim();
+    const remotes = await git.getRemotes(true);
+    const origin = remotes.find((r) => r.name === "origin");
+    const originUrl = `${origin?.refs?.fetch ?? ""} ${origin?.refs?.push ?? ""}`;
+    const fromGithub = /github\.com/i.test(originUrl);
+    if (shallow !== "true" && !fromGithub) {
+      return { replaced: false };
+    }
+  }
+
+  await rm(path.join(localPath, ".git"), { recursive: true, force: true });
+
+  try {
+    const fresh = simpleGit(localPath);
+    await fresh.raw(["init", "--initial-branch", branch]);
+    await fresh.addConfig("user.email", "documenter@localhost");
+    await fresh.addConfig("user.name", "Open Source Code Documenter");
+    await fresh.add(["-A"]);
+    const status = await fresh.status();
+    if (status.isClean()) {
+      await fresh.commit("Initial import", { "--allow-empty": null });
+    } else {
+      await fresh.commit(
+        "Initial import\n\nFresh repository created from a shallow GitHub checkout.",
+      );
+    }
+    return { replaced: true };
+  } catch (err) {
+    throw new WorkspaceError(
+      formatGitError(err, "Creating a fresh git repository"),
+      "commit",
+      err,
+    );
+  }
+}
+
 export async function commitAllChanges(
   localPath: string,
   message: string,

@@ -16,6 +16,7 @@ import {
   commitAllChanges,
   prepareGithubWorkspace,
   pushToRemote,
+  reinitializeAsFreshRepo,
 } from "./github.js";
 import { GitlabService } from "./gitlab.js";
 import { runMultiAgentDocumentation } from "./multi-agent-documenter.js";
@@ -222,15 +223,33 @@ export class JobManager {
         );
       }
 
+      const fresh = await reinitializeAsFreshRepo(localPath, branch);
+      if (fresh.replaced) {
+        this.log(
+          job,
+          "cloning",
+          "Removed the shallow GitHub .git directory and created a new repository with a single commit.",
+        );
+      } else {
+        this.log(
+          job,
+          "cloning",
+          "Workspace already has a non-shallow repository; keeping it for this retry.",
+        );
+      }
+
       this.setStatus(job, "creating_gitlab_project");
       const gitlab = new GitlabService(config.gitlabHost, config.gitlabToken);
+      const description = `Mirrored from ${request.githubUrl} — documented by Open Source Code Documenter`;
       let project;
       try {
-        project = await gitlab.createOrUpdateProject(
-          repo,
-          config.gitlabNamespace,
-          `Mirrored from ${request.githubUrl} — documented by Open Source Code Documenter`,
-        );
+        project = fresh.replaced
+          ? await gitlab.recreateProject(repo, config.gitlabNamespace, description)
+          : await gitlab.createOrUpdateProject(
+              repo,
+              config.gitlabNamespace,
+              description,
+            );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         throw new Error(`GitLab project setup failed: ${message}`);
@@ -240,11 +259,17 @@ export class JobManager {
       this.log(
         job,
         "creating_gitlab_project",
-        `GitLab project ready: ${project.webUrl}`,
+        fresh.replaced
+          ? `Created a new empty GitLab project: ${project.webUrl}`
+          : `GitLab project ready: ${project.webUrl}`,
       );
 
       this.setStatus(job, "pushing_to_gitlab");
-      this.log(job, "pushing_to_gitlab", "Pushing mirror to GitLab...");
+      this.log(
+        job,
+        "pushing_to_gitlab",
+        "Pushing fresh repository to GitLab...",
+      );
       try {
         await gitlab.mirrorToGitlab(localPath, project, branch);
       } catch (err) {
