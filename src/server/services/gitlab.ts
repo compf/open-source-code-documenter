@@ -1,6 +1,6 @@
-import { simpleGit, type RemoteWithRefs } from "simple-git";
+import type { RemoteWithRefs } from "simple-git";
 import { normalizeGitlabHost } from "../validation.js";
-import { WorkspaceError, formatGitError } from "./github.js";
+import { WorkspaceError, formatGitError, gitWithoutLfs } from "./github.js";
 
 export interface GitlabProjectInfo {
   id: number;
@@ -139,6 +139,7 @@ export class GitlabService {
         description,
         visibility: "private",
         initialize_with_readme: false,
+        lfs_enabled: false,
       }),
     });
 
@@ -204,7 +205,8 @@ export class GitlabService {
     branch: string,
   ): Promise<void> {
     try {
-      const git = simpleGit(localPath);
+      await this.disableLfs(project);
+      const git = gitWithoutLfs(localPath);
       const pushUrl = this.authenticatedPushUrl(project.httpUrlToRepo);
 
       const remotes = await git.getRemotes(true);
@@ -225,6 +227,19 @@ export class GitlabService {
         ),
         "push",
         err,
+      );
+    }
+  }
+
+  private async disableLfs(project: GitlabProjectInfo): Promise<void> {
+    const res = await fetch(`${this.apiBase()}/projects/${project.id}`, {
+      method: "PUT",
+      headers: this.headers(),
+      body: JSON.stringify({ lfs_enabled: false }),
+    });
+    if (!res.ok && res.status !== 404) {
+      throw new Error(
+        `Failed to disable Git LFS on "${project.pathWithNamespace}": ${res.status} ${await this.readErrorBody(res)}`,
       );
     }
   }

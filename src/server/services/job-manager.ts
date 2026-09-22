@@ -228,7 +228,9 @@ export class JobManager {
         this.log(
           job,
           "cloning",
-          "Removed the shallow GitHub .git directory and created a new repository with a single commit.",
+          fresh.lfsRemoved
+            ? "Removed Git LFS rules and pointer files, then created a new single-commit repository."
+            : "Removed the shallow GitHub .git directory and created a new repository with a single commit.",
         );
       } else {
         this.log(
